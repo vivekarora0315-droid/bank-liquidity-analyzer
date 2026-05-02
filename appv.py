@@ -200,8 +200,8 @@ BANKS = {
         "nsfr_pct":    None,
         "nsfr_asf":    None,
         "nsfr_rsf":    None,
-        # Balance sheet -- Q1 2026 (verified vs JPM 1Q26 earnings release Apr 14 2026)
-        "assets":      4_900,      # Total assets (actual: ~$4.9T)
+        # Balance sheet -- Q4 2025 / Q1 2026 (aligned with SEC-filed XBRL; verified vs JPM 1Q26 earnings release Apr 14 2026)
+        "assets":      4_425,      # Total assets (Q4 2025 10-K filed Feb 2026 -- matches XBRL)
         "deposits":    2_559,      # End-of-period deposits
         "loans":       1_501,      # Total loans
         "equity":      362,
@@ -660,18 +660,40 @@ def fetch_edgar_latest_filing(cik: str) -> dict:
 # We pull the MOST RECENT value so the UI shows the filed number, not
 # our approximation. Mismatches trigger a visible warning.
 # -------------------------------------------------------------------------
+# Each line item maps to a PRIORITY-ORDERED LIST of US-GAAP concept tags.
+# Banks change their tagging across years -- e.g. JPM stopped using
+# "LoansAndLeasesReceivableNetReportedAmount" after 2016 and "LongTermDebt"
+# after 2014, switching to alternate tags. We try each candidate in order
+# and pick the FIRST one that returns a recent (<= ~18 months old) filing.
 XBRL_CONCEPTS = {
-    "assets":    "Assets",
-    "deposits":  "Deposits",
-    "equity":    "StockholdersEquity",
-    "lt_debt":   "LongTermDebt",
-    "loans":     "LoansAndLeasesReceivableNetReportedAmount",
+    "assets":   ["Assets"],
+    "deposits": ["Deposits", "DepositsTotal"],
+    "equity":   [
+        "StockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    ],
+    "lt_debt":  [
+        "LongTermDebtNoncurrent",
+        "LongTermDebt",
+        "LongTermBorrowings",
+    ],
+    "loans":    [
+        "LoansAndLeasesReceivableNetOfDeferredIncome",
+        "LoansAndLeasesReceivableNetReportedAmount",
+        "Loans",
+        "FinancingReceivableExcludingAccruedInterestAfterAllowanceForCreditLoss",
+        "NotesReceivableNet",
+    ],
 }
+
+# Reject any "latest" filing older than this many days. Prevents the API
+# from returning a 10-year-old tag when the bank stopped using it.
+XBRL_MAX_AGE_DAYS = 550   # ~18 months -- covers a full annual + quarterly cycle
 
 
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
-def fetch_edgar_xbrl_fact(cik: str, concept: str) -> Optional[dict]:
-    """Fetch the most recently filed value for a US-GAAP concept."""
+def _fetch_one_concept(cik: str, concept: str) -> Optional[dict]:
+    """Fetch the most recently filed value for a single US-GAAP concept."""
     try:
         cik_padded = cik.zfill(10)
         url = (
@@ -680,19 +702,22 @@ def fetch_edgar_xbrl_fact(cik: str, concept: str) -> Optional[dict]:
         )
         headers = {"User-Agent": "Bank Liquidity Analyzer research@example.com"}
         r = requests.get(url, headers=headers, timeout=10)
+        if r.status_code == 404:
+            # Concept not tagged for this issuer -- normal, try the next candidate
+            return None
         r.raise_for_status()
         js = r.json()
-        # USD unit (occasionally USD-per-share for other concepts, but these are all $)
         units = js.get("units", {}).get("USD", [])
         if not units:
             return None
-        # Prefer 10-K / 10-Q filings and take the entry with the latest filed date
+        # Prefer 10-K / 10-Q filings; sort by filed-date DESC then period-end DESC
         picks = [u for u in units if u.get("form") in ("10-K", "10-Q", "10-K/A", "10-Q/A")]
         if not picks:
             picks = units
         picks.sort(key=lambda u: (u.get("filed", ""), u.get("end", "")), reverse=True)
         latest = picks[0]
         return {
+            "concept":   concept,
             "value_usd": latest.get("val"),
             "value_bn":  latest.get("val", 0) / 1_000_000_000,
             "period_end":latest.get("end"),
@@ -706,9 +731,51 @@ def fetch_edgar_xbrl_fact(cik: str, concept: str) -> Optional[dict]:
         return None
 
 
+def _is_fresh(fact: dict, max_age_days: int = XBRL_MAX_AGE_DAYS) -> bool:
+    """True if the filing's `filed` date is within `max_age_days` of today."""
+    if not fact:
+        return False
+    filed = fact.get("filed")
+    if not filed:
+        return False
+    try:
+        from datetime import datetime, date
+        filed_dt = datetime.strptime(filed, "%Y-%m-%d").date()
+        return (date.today() - filed_dt).days <= max_age_days
+    except Exception:
+        return False
+
+
+def fetch_edgar_xbrl_fact(cik: str, concept_or_list) -> Optional[dict]:
+    """
+    Try each candidate concept in order; return the first one that yields
+    a FRESH filing (within ~18 months). If none are fresh but at least one
+    returned data, return the most-recently-filed result anyway with a
+    `stale` flag so the UI can warn instead of silently displaying old data.
+    """
+    candidates = (
+        [concept_or_list] if isinstance(concept_or_list, str) else list(concept_or_list)
+    )
+    fallback = None
+    for concept in candidates:
+        fact = _fetch_one_concept(cik, concept)
+        if fact is None:
+            continue
+        if _is_fresh(fact):
+            fact["stale"] = False
+            return fact
+        # Keep the most-recently-filed stale result as a last-resort fallback
+        if fallback is None or (fact.get("filed", "") > fallback.get("filed", "")):
+            fallback = fact
+    if fallback is not None:
+        fallback["stale"] = True
+        return fallback
+    return None
+
+
 @st.cache_data(ttl=60 * 60 * 6, show_spinner=False)
 def fetch_all_xbrl_facts(cik: str) -> dict:
-    """Pull all tracked concepts for a bank in one call-cached dict."""
+    """Pull all tracked concepts for a bank, trying fallback tags per item."""
     return {k: fetch_edgar_xbrl_fact(cik, c) for k, c in XBRL_CONCEPTS.items()}
 
 
@@ -1064,7 +1131,7 @@ with st.expander("🔍 **Data verification — app vs. SEC-filed XBRL**", expand
     ]:
         app_val = d[key]
         fact = xbrl_facts.get(key)
-        if fact and fact.get("value_bn") is not None:
+        if fact and fact.get("value_bn") is not None and not fact.get("stale", False):
             filed_val = round(fact["value_bn"], 1)
             diff_pct = (filed_val - app_val) / app_val * 100 if app_val else 0
             flag = "✅ match" if abs(diff_pct) < 5 else f"⚠️ {diff_pct:+.1f}% gap"
@@ -1073,9 +1140,20 @@ with st.expander("🔍 **Data verification — app vs. SEC-filed XBRL**", expand
                 "App value":     f"${app_val:,.0f}B",
                 "SEC-filed":     f"${filed_val:,.1f}B",
                 "Period end":    fact.get("period_end", ""),
-                "Form":          fact.get("form", ""),
-                "Filed":         fact.get("filed", ""),
-                "Check":         flag,
+                "Form":           fact.get("form", ""),
+                "Filed":           fact.get("filed", ""),
+                "Check":          flag,
+            })
+        elif fact and fact.get("stale", False):
+            # Stale tag (issuer stopped using this concept) -- show but flag
+            verif_rows.append({
+                "Line item":  label,
+                "App value":  f"${app_val:,.0f}B",
+                "SEC-filed":  "—",
+                "Period end": "",
+                "Form":       "",
+                "Filed":      "",
+                "Check":      "tag retired -- not in recent filings",
             })
         else:
             verif_rows.append({
